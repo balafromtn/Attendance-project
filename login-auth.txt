@@ -1,0 +1,8 @@
+{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmcmVzaCI6ZmFsc2UsImlhdCI6MTc2MjUyMDgzOCwianRpIjoiZjNjNGVjNmEtZTY5My00M2Q0LThkZWUtYzhiMGYyZjcxOTFjIiwidHlwZSI6ImFjY2VzcyIsInN1YiI6IjY5MGRkMjFkMTE4ZjY0YzljYjI3ZTE5ZCIsIm5iZiI6MTc2MjUyMDgzOCwiY3NyZiI6ImY5NGIzOWM0LWUzZGYtNDRkZS1hNTdhLWRhOGNmNWU3YTliZCIsImV4cCI6MTc2MjUyMTczOCwidXNlcm5hbWUiOiJzdXBlcmFkbWluIiwicm9sZXMiOlsic3VwZXJhZG1pbiJdfQ.-BnxOUW1vquD2THv_mbN6Wy-g_seu2_RsHImsArAPr0","message":"Login successful"}
+
+
+
+{
+    "message": "Staff user created successfully",
+    "userId": "690def7e0c802310d5004e8c"
+}

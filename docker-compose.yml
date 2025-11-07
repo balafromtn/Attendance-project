@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # Service 1: The MongoDB Database
+  db:
+    image: mongo:latest
+    container_name: attendance-db
+    ports:
+      - "27017:27017" # Exposes the DB to your computer for easy debugging
+    volumes:
+      - mongo-data:/data/db # Persists data
+    networks:
+      - attendance-network
+
+  # Service 2: The Flask Backend (API)
+  backend:
+    build:
+      context: ./backend # Tells Docker to build from the 'backend' folder
+    container_name: attendance-api
+    ports:
+      - "5000:5000" # Exposes the Flask port
+    volumes:
+      - ./backend:/app # Mounts your code for "live reload"
+    networks:
+      - attendance-network
+    environment:
+      # This is how Flask will find the database
+      - MONGO_URI=mongodb://db:27017/attendanceDB
+    depends_on:
+      - db # Makes sure the DB starts before the backend
+
+  # Service 3: The React Frontend (UI)
+  frontend:
+    build:
+      context: ./frontend # Tells Docker to build from the 'frontend' folder
+    container_name: attendance-ui
+    ports:
+      - "3000:3000" # Exposes the React dev server port
+    volumes:
+      - ./frontend:/app # Mounts your code for "live reload"
+      - /app/node_modules # Prevents a common Docker/Node error
+    depends_on:
+      - backend
+    networks:
+      - attendance-network
+    stdin_open: true # Keeps the container running for React's dev server
+    tty: true
+
+# These define the shared network and persistent volume
+networks:
+  attendance-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local
