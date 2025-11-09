@@ -53,15 +53,47 @@ def test_connection():
         return jsonify({"message": f"Connection failed: {e}"}), 500
 
 
+# --- STUDENT AUTHENTICATION ---
+
+@app.route('/api/student/login', methods=['POST'])
+def student_login():
+    try:
+        data = request.get_json()
+        register_number = data.get('registerNumber')
+        dob = data.get('dob') # Expected format: "YYYY-MM-DD"
+
+        if not register_number or not dob:
+            return jsonify({"error": "Register Number and D.O.B. are required"}), 400
+
+        students_collection = db.students
+        student = students_collection.find_one({
+            "registerNumber": register_number
+        })
+
+        if student and student['dob'] == dob:
+            identity = str(student['_id'])
+            additional_claims = {
+                "name": student['name'],
+                "registerNumber": student['registerNumber'],
+                "roles": ["student"] # Hardcode the student role
+            }
+            access_token = create_access_token(identity=identity, additional_claims=additional_claims)
+            
+            return jsonify({
+                "message": "Login successful",
+                "access_token": access_token
+            }), 200
+        else:
+            return jsonify({"error": "Invalid Register Number or D.O.B."}), 401
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # --- STAFF AUTHENTICATION ENDPOINTS ---
 
 @app.route('/api/staff/register', methods=['POST'])
-@role_required('superadmin') # (!!!) CHANGED (!!!) - This is now protected!
+@role_required('superadmin')
 def staff_register():
-    """
-    Creates a new staff user (tutor, faculty, admin).
-    Protected: Only a 'superadmin' can access this.
-    """
     try:
         data = request.get_json()
         username = data.get('username')
@@ -88,7 +120,6 @@ def staff_register():
             "message": "Staff user created successfully",
             "userId": str(result.inserted_id)
         }), 201
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -169,27 +200,21 @@ def get_all_classes():
         return jsonify({"error": str(e)}), 500
 
 
-# --- (!!!) NEW - SUPERADMIN: Staff Management (!!!) ---
+# --- SUPERADMIN: Staff Management ---
 
 @app.route('/api/admin/staff', methods=['GET'])
 @role_required('superadmin')
 def get_all_staff():
-    """
-    Gets a list of all staff (users collection), but omits passwords.
-    Protected: Only a 'superadmin' can access this.
-    """
     try:
         users_collection = db.users
         all_staff = []
         
-        # Find all documents, convert ObjectId, and remove password
         for doc in users_collection.find():
             doc['_id'] = str(doc['_id'])
-            del doc['password'] # Never send passwords to the frontend!
+            del doc['password']
             all_staff.append(doc)
 
         return jsonify(all_staff), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -197,10 +222,6 @@ def get_all_staff():
 @app.route('/api/admin/classes/<classId>/assign-tutor', methods=['PUT'])
 @role_required('superadmin')
 def assign_tutor(classId):
-    """
-    Assigns a tutor to a class by updating the class's 'tutorId' field.
-    Protected: Only a 'superadmin' can access this.
-    """
     try:
         data = request.get_json()
         tutor_id = data.get('tutorId')
@@ -209,21 +230,258 @@ def assign_tutor(classId):
             return jsonify({"error": "tutorId is required"}), 400
         
         classes_collection = db.classes
+        users_collection = db.users
         
-        # Find the class and update it
+        tutor = users_collection.find_one({'_id': ObjectId(tutor_id), 'roles': 'tutor'})
+        if not tutor:
+            return jsonify({"error": "Tutor not found or user is not a tutor"}), 404
+
+        existing_class = classes_collection.find_one({"tutorId": ObjectId(tutor_id)})
+        if existing_class and str(existing_class['_id']) != classId:
+            return jsonify({"error": "This tutor is already assigned to another class"}), 400
+
         result = classes_collection.update_one(
             {'_id': ObjectId(classId)},
-            {'$set': {'tutorId': ObjectId(tutor_id)}} # Store as ObjectId for proper linking
+            {'$set': {'tutorId': ObjectId(tutor_id)}}
         )
 
         if result.matched_count == 0:
             return jsonify({"error": "Class not found"}), 404
 
         return jsonify({"message": "Tutor assigned successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- TUTOR: Student Management ---
+
+# Helper function to find a tutor's class
+def get_tutor_class(tutor_id):
+    classes_collection = db.classes
+    tutor_class = classes_collection.find_one({"tutorId": ObjectId(tutor_id)})
+    return tutor_class
+
+@app.route('/api/tutor/students', methods=['POST'])
+@role_required('tutor')
+def add_student():
+    try:
+        tutor_id = get_jwt_identity()
+        
+        tutor_class = get_tutor_class(tutor_id)
+        if not tutor_class:
+            return jsonify({"error": "You are not assigned to any class"}), 403
+
+        data = request.get_json()
+        
+        new_student = {
+            "name": data.get("name"),
+            "registerNumber": data.get("registerNumber"),
+            "dob": data.get("dob"),
+            "classId": tutor_class['_id']
+        }
+
+        if not new_student['name'] or not new_student['registerNumber'] or not new_student['dob']:
+            return jsonify({"error": "Name, registerNumber, and dob are required"}), 400
+
+        students_collection = db.students
+        if students_collection.find_one({"registerNumber": new_student['registerNumber']}):
+            return jsonify({"error": "Student with this register number already exists"}), 400
+        
+        result = students_collection.insert_one(new_student)
+        
+        return jsonify({
+            "message": "Student added successfully",
+            "studentId": str(result.inserted_id)
+        }), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/tutor/students', methods=['GET'])
+@role_required('tutor')
+def get_my_students():
+    try:
+        tutor_id = get_jwt_identity()
+        
+        tutor_class = get_tutor_class(tutor_id)
+        if not tutor_class:
+            return jsonify({"error": "You are not assigned to any class"}), 403
+
+        students_collection = db.students
+        my_students = []
+        for doc in students_collection.find({"classId": tutor_class['_id']}):
+            doc['_id'] = str(doc['_id'])
+            doc['classId'] = str(doc['classId'])
+            my_students.append(doc)
+
+        return jsonify(my_students), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- (!!!) NEW - TUTOR: Timetable Management (!!!) ---
+
+@app.route('/api/tutor/timetable', methods=['GET'])
+@role_required('tutor')
+def get_timetable():
+    """
+    Gets the timetable for the logged-in tutor's class.
+    """
+    try:
+        tutor_id = get_jwt_identity()
+        tutor_class = get_tutor_class(tutor_id)
+        if not tutor_class:
+            return jsonify({"error": "You are not assigned to any class"}), 403
+
+        timetable_collection = db.timetable
+        # Find the timetable for this class
+        timetable = timetable_collection.find_one({"classId": tutor_class['_id']})
+        
+        if not timetable:
+            # No timetable exists yet, return an empty structure
+            return jsonify({
+                "message": "No timetable found for this class. Please create one.",
+                "timetable": None
+            }), 404
+        
+        timetable['_id'] = str(timetable['_id'])
+        timetable['classId'] = str(timetable['classId'])
+        
+        return jsonify(timetable), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tutor/timetable', methods=['PUT'])
+@role_required('tutor')
+def update_timetable():
+    """
+    Creates or updates the timetable for the logged-in tutor's class.
+    Expects a full 5-day, 5-hour schedule in the request body.
+    """
+    try:
+        tutor_id = get_jwt_identity()
+        tutor_class = get_tutor_class(tutor_id)
+        if not tutor_class:
+            return jsonify({"error": "You are not assigned to any class"}), 403
+
+        data = request.get_json()
+        
+        # We need to convert faculty IDs from strings to ObjectIds
+        schedule = {}
+        for day, hours in data.items(): # e.g., day="monday", hours={...}
+            schedule[day] = {
+                "hour_1": ObjectId(hours.get("hour_1")) if hours.get("hour_1") else None,
+                "hour_2": ObjectId(hours.get("hour_2")) if hours.get("hour_2") else None,
+                "hour_3": ObjectId(hours.get("hour_3")) if hours.get("hour_3") else None,
+                "hour_4": ObjectId(hours.get("hour_4")) if hours.get("hour_4") else None,
+                "hour_5": ObjectId(hours.get("hour_5")) if hours.get("hour_5") else None,
+            }
+
+        timetable_collection = db.timetable
+        
+        # Use 'upsert=True' to create a new one if it doesn't exist,
+        # or update the existing one.
+        timetable_collection.update_one(
+            {"classId": tutor_class['_id']},
+            {'$set': {
+                "classId": tutor_class['_id'],
+                "schedule": schedule # The full schedule object
+            }},
+            upsert=True
+        )
+        
+        return jsonify({"message": "Timetable updated successfully"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- STUDENT DASHBOARD ENDPOINTS ---
+
+@app.route('/api/student/me', methods=['GET'])
+@role_required('student')
+def get_student_me():
+    try:
+        student_id = get_jwt_identity()
+        
+        students_collection = db.students
+        student = students_collection.find_one({"_id": ObjectId(student_id)})
+        
+        if not student:
+            return jsonify({"error": "Student not found"}), 404
+
+        class_collection = db.classes
+        student_class = class_collection.find_one({"_id": student['classId']})
+        
+        profile = {
+            "name": student['name'],
+            "registerNumber": student['registerNumber'],
+            "dob": student['dob'],
+            "classInfo": {
+                "degreeType": student_class.get('degreeType'),
+                "year": student_class.get('year'),
+                "department": student_class.get('department'),
+                "shift": student_class.get('shift')
+            }
+        }
+        
+        return jsonify(profile), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/student/my-attendance', methods=['GET'])
+@role_required('student')
+def get_student_attendance():
+    try:
+        student_id = get_jwt_identity()
+        
+        attendance_collection = db.attendance_records
+        records = list(attendance_collection.find({"studentId": ObjectId(student_id)}))
+        
+        total_present = 0
+        total_absent = 0
+        total_on_duty = 0
+        
+        for record in records:
+            if record['status'] == 'present':
+                total_present += 1
+            elif record['status'] == 'absent':
+                total_absent += 1
+            elif record['status'] == 'on_duty':
+                total_on_duty += 1
+        
+        total_marked_hours = total_present + total_absent + total_on_duty
+        
+        total_counted_as_present = total_present + total_on_duty
+        percentage = 0
+        if total_marked_hours > 0:
+            percentage = (total_counted_as_present / total_marked_hours) * 100
+        
+        serializable_records = []
+        for record in records:
+            record['_id'] = str(record['_id'])
+            record['studentId'] = str(record['studentId'])
+            serializable_records.append(record)
+            
+        return jsonify({
+            "stats": {
+                "totalPresent": total_present,
+                "totalAbsent": total_absent,
+                "totalOnDuty": total_on_duty,
+                "totalMarkedHours": total_marked_hours,
+                "percentage": round(percentage, 2)
+            },
+            "records": serializable_records
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # --- Run the App ---
 if __name__ == '__main__':
