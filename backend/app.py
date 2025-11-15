@@ -6,6 +6,7 @@ from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, get_jwt
 from bson.objectid import ObjectId
 from functools import wraps
+from datetime import datetime # --- NEW --- To get the current day
 
 # --- App Configuration ---
 app = Flask(__name__)
@@ -293,7 +294,6 @@ def add_student():
             "message": "Student added successfully",
             "studentId": str(result.inserted_id)
         }), 201
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -316,19 +316,15 @@ def get_my_students():
             my_students.append(doc)
 
         return jsonify(my_students), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# --- (!!!) NEW - TUTOR: Timetable Management (!!!) ---
+# --- TUTOR: Timetable Management ---
 
 @app.route('/api/tutor/timetable', methods=['GET'])
 @role_required('tutor')
 def get_timetable():
-    """
-    Gets the timetable for the logged-in tutor's class.
-    """
     try:
         tutor_id = get_jwt_identity()
         tutor_class = get_tutor_class(tutor_id)
@@ -336,21 +332,31 @@ def get_timetable():
             return jsonify({"error": "You are not assigned to any class"}), 403
 
         timetable_collection = db.timetable
-        # Find the timetable for this class
-        timetable = timetable_collection.find_one({"classId": tutor_class['_id']})
+        timetable_doc = timetable_collection.find_one({"classId": tutor_class['_id']})
         
-        if not timetable:
-            # No timetable exists yet, return an empty structure
+        if not timetable_doc:
             return jsonify({
                 "message": "No timetable found for this class. Please create one.",
                 "timetable": None
             }), 404
         
-        timetable['_id'] = str(timetable['_id'])
-        timetable['classId'] = str(timetable['classId'])
+        serializable_timetable = {
+            "_id": str(timetable_doc.get('_id')),
+            "classId": str(timetable_doc.get('classId')),
+            "schedule": {}
+        }
         
-        return jsonify(timetable), 200
-
+        if 'schedule' in timetable_doc:
+            for day, hours in timetable_doc['schedule'].items():
+                serializable_timetable['schedule'][day] = {
+                    "hour_1": str(hours.get("hour_1")) if hours.get("hour_1") else None,
+                    "hour_2": str(hours.get("hour_2")) if hours.get("hour_2") else None,
+                    "hour_3": str(hours.get("hour_3")) if hours.get("hour_3") else None,
+                    "hour_4": str(hours.get("hour_4")) if hours.get("hour_4") else None,
+                    "hour_5": str(hours.get("hour_5")) if hours.get("hour_5") else None,
+                }
+        
+        return jsonify(serializable_timetable), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -358,10 +364,6 @@ def get_timetable():
 @app.route('/api/tutor/timetable', methods=['PUT'])
 @role_required('tutor')
 def update_timetable():
-    """
-    Creates or updates the timetable for the logged-in tutor's class.
-    Expects a full 5-day, 5-hour schedule in the request body.
-    """
     try:
         tutor_id = get_jwt_identity()
         tutor_class = get_tutor_class(tutor_id)
@@ -370,32 +372,36 @@ def update_timetable():
 
         data = request.get_json()
         
-        # We need to convert faculty IDs from strings to ObjectIds
         schedule = {}
-        for day, hours in data.items(): # e.g., day="monday", hours={...}
-            schedule[day] = {
-                "hour_1": ObjectId(hours.get("hour_1")) if hours.get("hour_1") else None,
-                "hour_2": ObjectId(hours.get("hour_2")) if hours.get("hour_2") else None,
-                "hour_3": ObjectId(hours.get("hour_3")) if hours.get("hour_3") else None,
-                "hour_4": ObjectId(hours.get("hour_4")) if hours.get("hour_4") else None,
-                "hour_5": ObjectId(hours.get("hour_5")) if hours.get("hour_5") else None,
-            }
+        users_collection = db.users
+        
+        for day, hours in data.items():
+            schedule[day] = {}
+            for hour, faculty_id_str in hours.items():
+                if faculty_id_str:
+                    faculty = users_collection.find_one({
+                        "_id": ObjectId(faculty_id_str),
+                        "roles": "faculty"
+                    })
+                    if not faculty:
+                        return jsonify({"error": f"Invalid faculty ID for {day}, {hour}: {faculty_id_str}"}), 400
+                    
+                    schedule[day][hour] = ObjectId(faculty_id_str)
+                else:
+                    schedule[day][hour] = None
 
         timetable_collection = db.timetable
         
-        # Use 'upsert=True' to create a new one if it doesn't exist,
-        # or update the existing one.
         timetable_collection.update_one(
             {"classId": tutor_class['_id']},
             {'$set': {
                 "classId": tutor_class['_id'],
-                "schedule": schedule # The full schedule object
+                "schedule": schedule
             }},
             upsert=True
         )
         
         return jsonify({"message": "Timetable updated successfully"}), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -430,7 +436,6 @@ def get_student_me():
         }
         
         return jsonify(profile), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -479,9 +484,176 @@ def get_student_attendance():
             },
             "records": serializable_records
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- (!!!) NEW - FACULTY: Attendance Marking (!!!) ---
+
+@app.route('/api/faculty/my-schedule', methods=['GET'])
+@role_required('faculty')
+def get_my_schedule_today():
+    """
+    Finds all classes/hours the logged-in faculty member
+    teaches for the current day of the week.
+    """
+    try:
+        faculty_id = get_jwt_identity()
+        
+        # Get current day (e.g., "monday", "tuesday")
+        today_day = datetime.now().strftime('%A').lower() # e.g., 'saturday'
+        
+        # If it's Saturday or Sunday, return empty
+        if today_day in ['saturday', 'sunday']:
+            return jsonify({
+                "day": today_day,
+                "schedule": []
+            }), 200
+            
+        timetable_collection = db.timetable
+        classes_collection = db.classes
+        
+        my_schedule = []
+        
+        # Find all timetables
+        for timetable in timetable_collection.find():
+            if today_day in timetable['schedule']:
+                day_schedule = timetable['schedule'][today_day]
+                class_info = classes_collection.find_one({"_id": timetable['classId']})
+
+                for hour, assigned_faculty_id in day_schedule.items():
+                    if str(assigned_faculty_id) == faculty_id:
+                        # This faculty teaches this hour!
+                        my_schedule.append({
+                            "classId": str(class_info['_id']),
+                            "className": f"{class_info['year']} {class_info['department']} {class_info.get('shift', '')}",
+                            "hour": int(hour.split('_')[1]) # "hour_1" -> 1
+                        })
+
+        return jsonify({
+            "day": today_day,
+            "schedule": my_schedule
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/faculty/class-list/<classId>', methods=['GET'])
+@role_required('faculty')
+def get_class_list_for_marking(classId):
+    """
+    Gets the list of students for a specific class.
+    Also returns any attendance already marked for today.
+    """
+    try:
+        students_collection = db.students
+        attendance_collection = db.attendance_records
+        
+        # Get today's date as a string "YYYY-MM-DD"
+        today_date = datetime.now().strftime('%Y-%m-%d')
+        
+        student_list = []
+        for student in students_collection.find({"classId": ObjectId(classId)}):
+            # For each student, find their attendance records for today
+            student_attendance_today = {}
+            for i in range(1, 6): # Hours 1-5
+                record = attendance_collection.find_one({
+                    "studentId": student['_id'],
+                    "date": today_date,
+                    "hour": i
+                })
+                student_attendance_today[f"hour_{i}"] = record['status'] if record else "not_marked"
+
+            student_list.append({
+                "studentId": str(student['_id']),
+                "name": student['name'],
+                "registerNumber": student['registerNumber'],
+                "attendance": student_attendance_today
+            })
+            
+        return jsonify(student_list), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/faculty/mark-attendance', methods=['POST'])
+@role_required('faculty')
+def mark_attendance():
+    """
+    Marks (or updates) an attendance record for a single student/hour.
+    """
+    try:
+        faculty_id = get_jwt_identity()
+        data = request.get_json()
+        
+        student_id = data.get('studentId')
+        hour = data.get('hour') # e.g., 1, 2, 3
+        status = data.get('status') # "present", "absent", "on_duty"
+        
+        # Get today's date as a string "YYYY-MM-DD"
+        today_date = datetime.now().strftime('%Y-%m-%d')
+
+        if not student_id or not hour or not status:
+            return jsonify({"error": "studentId, hour, and status are required"}), 400
+        
+        if status not in ['present', 'absent', 'on_duty']:
+            return jsonify({"error": "Invalid status"}), 400
+
+        # --- (!!!) CRITICAL SECURITY CHECK (!!!) ---
+        # Check if this faculty is *actually* assigned to teach this
+        # student's class at this hour on this day.
+        
+        students_collection = db.students
+        timetable_collection = db.timetable
+        
+        # 1. Find the student's class
+        student = students_collection.find_one({"_id": ObjectId(student_id)})
+        if not student:
+            return jsonify({"error": "Student not found"}), 404
+        
+        # 2. Find the timetable for that class
+        timetable = timetable_collection.find_one({"classId": student['classId']})
+        if not timetable:
+            return jsonify({"error": "No timetable found for this class"}), 404
+            
+        # 3. Check today's schedule
+        today_day = datetime.now().strftime('%A').lower()
+        if today_day not in timetable['schedule']:
+             return jsonify({"error": "No schedule for today"}), 400
+        
+        hour_key = f"hour_{hour}"
+        assigned_faculty_id = timetable['schedule'][today_day].get(hour_key)
+        
+        if str(assigned_faculty_id) != faculty_id:
+            return jsonify({"error": "Access forbidden: You do not teach this hour."}), 403
+        
+        # --- (Security Check Passed) ---
+        
+        attendance_collection = db.attendance_records
+        
+        # Use 'upsert=True' to create a new record or update an existing one
+        attendance_collection.update_one(
+            {
+                "studentId": ObjectId(student_id),
+                "date": today_date,
+                "hour": hour
+            },
+            {
+                "$set": {
+                    "status": status,
+                    "markedBy": ObjectId(faculty_id),
+                    "classId": student['classId']
+                }
+            },
+            upsert=True
+        )
+        
+        return jsonify({"message": "Attendance marked successfully"}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # --- Run the App ---
 if __name__ == '__main__':
