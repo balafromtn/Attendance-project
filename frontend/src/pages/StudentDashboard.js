@@ -53,8 +53,12 @@ const StudentDashboard = () => {
     fetchData();
   }, [navigate]);
 
+  // ...
   if (loading) return <div className="loading-screen">Loading Dashboard...</div>;
   if (error) return <div className="error-screen">{error} <button onClick={handleLogout}>Go Back</button></div>;
+
+  // ADD THIS LINE TO DEBUG
+  console.log("API Stats Data:", attendance?.stats); 
 
   return (
     <div className="dashboard-container">
@@ -71,19 +75,28 @@ const StudentDashboard = () => {
       <div className="stats-grid">
         <div className="stat-card primary">
           <h3>Total Percentage</h3>
-          <div className="big-number">{attendance?.stats?.percentage}%</div>
+          <div className="big-number">
+            {attendance?.stats?.percentage ?? 0}%
+          </div>
         </div>
         <div className="stat-card">
           <h3>Present Hours</h3>
-          <div className="number">{attendance?.stats?.totalPresent}</div>
+          <div className="number">
+            {/* Check for both naming styles and default to 0 */}
+            {attendance?.stats?.totalPresent ?? attendance?.stats?.total_present ?? 0}
+          </div>
         </div>
         <div className="stat-card">
           <h3>Absent Hours</h3>
-          <div className="number">{attendance?.stats?.totalAbsent}</div>
+          <div className="number">
+            {attendance?.stats?.totalAbsent ?? attendance?.stats?.total_absent ?? 0}
+          </div>
         </div>
         <div className="stat-card">
           <h3>On Duty</h3>
-          <div className="number">{attendance?.stats?.totalOnDuty}</div>
+          <div className="number">
+            {attendance?.stats?.totalOnDuty ?? attendance?.stats?.total_on_duty ?? 0}
+          </div>
         </div>
       </div>
 
