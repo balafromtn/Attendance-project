@@ -6,5 +6,16 @@
     "userId": "690def7e0c802310d5004e8c"
 }
 
-{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmcmVzaCI6ZmFsc2UsImlhdCI6MTc2Mzc0NDU4NywianRpIjoiNTliMGYwZGYtN2YxMS00MThlLThiNzUtNTMwNjJiNTI4NzY1IiwidHlwZSI6ImFjY2VzcyIsInN1YiI6IjY5MGRlZjdlMGM4MDIzMTBkNTAwNGU4YyIsIm5iZiI6MTc2Mzc0NDU4NywiY3NyZiI6IjMxYTM0YjgwLTNjNjQtNDQ0Mi1hYWFkLWViZDVmM2U1ODNlYSIsImV4cCI6MTc2Mzc0NTQ4NywidXNlcm5hbWUiOiJ0dXRvcl9qb25lcyIsInJvbGVzIjpbInR1dG9yIiwiZmFjdWx0eSJdfQ.YA-AB4VVHiAdIlN5S7ywK_ZpTXWwt-TUdIjDcTQ-INU",
-"message":"Login successful","role":"staff"}
+{
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmcmVzaCI6ZmFsc2UsImlhdCI6MTc2Mzg3NTQzNywianRpIjoiMzQ0MGIyYjAtYmRkOC00ZmVmLTlmZGUtNWE3ZjIzMzViMzhjIiwidHlwZSI6ImFjY2VzcyIsInN1YiI6IjY5MGRkMjFkMTE4ZjY0YzljYjI3ZTE5ZCIsIm5iZiI6MTc2Mzg3NTQzNywiY3NyZiI6ImUyMjBhN2FiLTA4MGItNGE5OC1hYzZmLTA3MTQ3NTk1NDY2MCIsImV4cCI6MTc2Mzg3NjMzNywibmFtZSI6InN1cGVyYWRtaW4iLCJyb2xlcyI6WyJzdXBlcmFkbWluIl0sImRlcGFydG1lbnQiOiIiLCJlbWFpbCI6IiJ9.mMFFmF5bGauMtF56cIBu5hLoza25w-gqgJmSCrGBYD8",
+    "message": "Login successful",
+    "role": "superadmin",
+    "user_details": {
+        "department": "",
+        "email": "",
+        "name": "superadmin",
+        "roles": [
+            "superadmin"
+        ]
+    }
+}

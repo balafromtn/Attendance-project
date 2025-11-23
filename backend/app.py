@@ -1,16 +1,20 @@
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from pymongo import MongoClient
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager, get_jwt
 from bson.objectid import ObjectId
 from functools import wraps
-from datetime import datetime 
+from datetime import datetime
+import csv
+import io
 
+# --- App Configuration ---
 app = Flask(__name__)
 CORS(app)
 
+# --- Database Configuration ---
 try:
     client = MongoClient(os.environ.get('MONGO_URI'))
     db = client.attendanceDB
@@ -23,14 +27,17 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # --- Helper: Role Check ---
-def role_required(role):
+def role_required(allowed_roles):
+    if not isinstance(allowed_roles, list):
+        allowed_roles = [allowed_roles]
+        
     def decorator(fn):
         @wraps(fn)
         @jwt_required()
         def wrapper(*args, **kwargs):
             claims = get_jwt()
-            user_roles = claims.get("roles")
-            if not user_roles or role not in user_roles:
+            user_roles = claims.get("roles", [])
+            if not any(r in user_roles for r in allowed_roles):
                 return jsonify({"error": "Access forbidden"}), 403
             return fn(*args, **kwargs)
         return wrapper
@@ -40,55 +47,62 @@ def role_required(role):
 def test_connection():
     return jsonify({"message": "Connected!"})
 
-# --- (!!!) NEW: UNIFIED LOGIN ENDPOINT (!!!) ---
+# ==========================================
+# 1. AUTHENTICATION
+# ==========================================
+
 @app.route('/api/login', methods=['POST'])
 def unified_login():
-    """
-    Tries to login as Staff first, then as Student.
-    Returns the token and the user type.
-    """
     try:
         data = request.get_json()
-        identifier = data.get('identifier') # Username OR Register No
-        password = data.get('password')     # Password OR D.O.B
+        identifier = data.get('identifier')
+        password = data.get('password')
 
         if not identifier or not password:
             return jsonify({"error": "Credentials required"}), 400
 
-        # 1. Try Staff Login
-        users_collection = db.users
-        user = users_collection.find_one({'username': identifier})
-
+        # A. Try Staff Login
+        user = db.users.find_one({'username': identifier})
         if user and bcrypt.check_password_hash(user['password'], password):
             identity = str(user['_id'])
-            additional_claims = {"username": user['username'], "roles": user['roles']}
+            additional_claims = {
+                "name": user.get('name', user['username']),
+                "roles": user['roles'],
+                "department": user.get('department', ''),
+                "email": user.get('email', '')
+            }
             access_token = create_access_token(identity=identity, additional_claims=additional_claims)
-            
-            # Check if superadmin or tutor/faculty to determine redirect suggestion
-            role_type = "superadmin" if "superadmin" in user['roles'] else "staff"
             
             return jsonify({
                 "message": "Login successful",
                 "access_token": access_token,
-                "role": role_type # 'superadmin' or 'staff'
+                "role": "superadmin" if "superadmin" in user['roles'] else "staff",
+                "user_details": additional_claims
             }), 200
 
-        # 2. Try Student Login
-        students_collection = db.students
-        student = students_collection.find_one({"registerNumber": identifier})
-
+        # B. Try Student Login
+        student = db.students.find_one({"registerNumber": identifier})
         if student and student['dob'] == password:
             identity = str(student['_id'])
+            
+            s_class = db.classes.find_one({"_id": student['classId']})
+            class_name = "Unknown Class"
+            if s_class:
+                class_name = f"{s_class['year']} {s_class['degreeType']} {s_class['department']} (Shift {s_class.get('shift', 1)})"
+
             additional_claims = {
                 "name": student['name'],
                 "registerNumber": student['registerNumber'],
-                "roles": ["student"]
+                "roles": ["student"],
+                "className": class_name,
+                "email": student.get('email', '')
             }
             access_token = create_access_token(identity=identity, additional_claims=additional_claims)
             return jsonify({
                 "message": "Login successful", 
                 "access_token": access_token,
-                "role": "student"
+                "role": "student",
+                "user_details": additional_claims
             }), 200
 
         return jsonify({"error": "Invalid credentials"}), 401
@@ -96,239 +110,295 @@ def unified_login():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- Keep Staff Register for Setup ---
+# ==========================================
+# 2. SUPERADMIN FEATURES
+# ==========================================
+
+@app.route('/api/admin/stats', methods=['GET'])
+@role_required(['superadmin'])
+def get_admin_dashboard_stats():
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$classId", 
+                    "total": {"$sum": 1},
+                    "present": {
+                        "$sum": {
+                            "$cond": [{"$in": ["$status", ["present", "on_duty"]]}, 1, 0]
+                        }
+                    }
+                }
+            }
+        ]
+        class_stats = list(db.attendance_records.aggregate(pipeline))
+        
+        dept_stats = {}
+        total_college_present = 0
+        total_college_records = 0
+        
+        for stat in class_stats:
+            class_info = db.classes.find_one({"_id": stat['_id']})
+            if class_info:
+                dept = class_info['department']
+                if dept not in dept_stats:
+                    dept_stats[dept] = {"present": 0, "total": 0}
+                
+                dept_stats[dept]["present"] += stat["present"]
+                dept_stats[dept]["total"] += stat["total"]
+                
+                total_college_present += stat["present"]
+                total_college_records += stat["total"]
+
+        dept_percentages = []
+        for dept, data in dept_stats.items():
+            pct = (data['present'] / data['total']) * 100 if data['total'] > 0 else 0
+            dept_percentages.append({"department": dept, "percentage": round(pct, 2)})
+            
+        college_pct = (total_college_present / total_college_records) * 100 if total_college_records > 0 else 0
+        
+        return jsonify({
+            "college_percentage": round(college_pct, 2),
+            "department_stats": dept_percentages
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/admin/classes', methods=['POST'])
+@role_required(['superadmin'])
+def create_class():
+    data = request.get_json()
+    db.classes.insert_one(data)
+    return jsonify({"message": "Class created successfully"}), 201
+
 @app.route('/api/staff/register', methods=['POST'])
-@role_required('superadmin')
-def staff_register():
+@role_required(['superadmin'])
+def create_staff():
     try:
         data = request.get_json()
-        hashed_pw = bcrypt.generate_password_hash(data.get('password')).decode('utf-8')
-        new_user = {"username": data.get('username'), "password": hashed_pw, "roles": data.get('roles')}
-        db.users.insert_one(new_user)
-        return jsonify({"message": "Staff created"}), 201
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        
+        # Check if username exists
+        if db.users.find_one({'username': data.get('username')}):
+            return jsonify({"error": "Username already exists"}), 400
 
-# --- ADMIN: Class & Staff ---
-@app.route('/api/admin/classes', methods=['POST'])
-@role_required('superadmin')
-def create_class():
-    db.classes.insert_one(request.get_json())
-    return jsonify({"message": "Class created"}), 201
+        hashed_pw = bcrypt.generate_password_hash(data.get('password')).decode('utf-8')
+        
+        new_user = {
+            "username": data.get('username'),
+            "password": hashed_pw,
+            "name": data.get('name'),
+            "email": data.get('email'),
+            "department": data.get('department'),
+            "roles": data.get('roles') 
+        }
+        result = db.users.insert_one(new_user)
+        
+        return jsonify({
+            "message": "Staff created successfully", 
+            "userId": str(result.inserted_id) 
+        }), 201
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/admin/classes', methods=['GET'])
-@role_required('superadmin')
+@role_required(['superadmin', 'faculty', 'tutor'])
 def get_all_classes():
-    classes = []
-    for doc in db.classes.find():
-        doc['_id'] = str(doc['_id'])
-        classes.append(doc)
-    return jsonify(classes), 200
+    try:
+        query = {}
+        year = request.args.get('year')
+        if year and year.isdigit(): query['year'] = int(year)
+            
+        shift = request.args.get('shift')
+        if shift and shift.isdigit(): query['shift'] = int(shift)
+            
+        department = request.args.get('department')
+        if department: query['department'] = {'$regex': f'^{department}$', '$options': 'i'}
+            
+        medium = request.args.get('medium')
+        if medium: query['medium'] = medium
 
-@app.route('/api/admin/staff', methods=['GET'])
-@role_required('superadmin')
-def get_all_staff():
-    staff = []
-    for doc in db.users.find():
-        doc['_id'] = str(doc['_id'])
-        del doc['password']
-        staff.append(doc)
-    return jsonify(staff), 200
+        classes = []
+        for doc in db.classes.find(query):
+            doc['_id'] = str(doc['_id'])
+            
+            # --- THE FIX IS HERE ---
+            if doc.get('tutorId'):
+                tutor = db.users.find_one({"_id": doc['tutorId']})
+                doc['tutorName'] = tutor['name'] if tutor else "Unknown"
+                doc['tutorId'] = str(doc['tutorId']) # <--- We must convert this to string!
+                
+            classes.append(doc)
+            
+        return jsonify(classes), 200
+    except Exception as e:
+        print(f"Search Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/admin/classes/<classId>/assign-tutor', methods=['PUT'])
-@role_required('superadmin')
+@role_required(['superadmin'])
 def assign_tutor(classId):
     data = request.get_json()
     db.classes.update_one({'_id': ObjectId(classId)}, {'$set': {'tutorId': ObjectId(data.get('tutorId'))}})
     return jsonify({"message": "Tutor assigned"}), 200
 
-# --- TUTOR: Students & Timetable ---
+# ==========================================
+# 3. FACULTY / STAFF FEATURES
+# ==========================================
+
+@app.route('/api/staff/class-students/<classId>', methods=['GET'])
+@role_required(['faculty', 'tutor'])
+def get_students_for_marking(classId):
+    date = request.args.get('date')
+    hour = request.args.get('hour')
+    
+    if not date or not hour:
+        return jsonify({"error": "Date and Hour required"}), 400
+
+    try:
+        students = []
+        if not ObjectId.is_valid(classId):
+             return jsonify({"error": "Invalid Class ID"}), 400
+
+        for s in db.students.find({"classId": ObjectId(classId)}):
+            record = db.attendance_records.find_one({
+                "studentId": s['_id'], "date": date, "hour": int(hour)
+            })
+            
+            students.append({
+                "studentId": str(s['_id']),
+                "registerNumber": s.get('registerNumber', 'N/A'),
+                "name": s.get('name', 'Unknown Student'), 
+                "status": record['status'] if record else None
+            })
+        return jsonify(students), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/staff/submit-attendance', methods=['POST'])
+@role_required(['faculty', 'tutor'])
+def submit_attendance_bulk():
+    try:
+        data = request.get_json()
+        marked_by = get_jwt_identity()
+        
+        class_id = data.get('classId')
+        date = data.get('date')
+        hour = int(data.get('hour'))
+        records = data.get('records')
+
+        if not records:
+            return jsonify({"error": "No records to submit"}), 400
+
+        for rec in records:
+            db.attendance_records.update_one(
+                {"studentId": ObjectId(rec['studentId']), "date": date, "hour": hour},
+                {"$set": {"status": rec['status'], "markedBy": ObjectId(marked_by), "classId": ObjectId(class_id)}},
+                upsert=True
+            )
+            
+        return jsonify({"message": "Attendance submitted successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# 4. TUTOR SPECIFIC FEATURES
+# ==========================================
+
 @app.route('/api/tutor/students', methods=['POST'])
-@role_required('tutor')
+@role_required(['tutor'])
 def add_student():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
-    if not tutor_class: return jsonify({"error": "No class assigned"}), 403
+    tutor_id = get_jwt_identity()
+    my_class = db.classes.find_one({"tutorId": ObjectId(tutor_id)})
+    if not my_class: return jsonify({"error": "No class assigned"}), 403
+    
     data = request.get_json()
-    data['classId'] = tutor_class['_id']
+    data['classId'] = my_class['_id']
+    if db.students.find_one({"registerNumber": data['registerNumber']}):
+        return jsonify({"error": "Register Number exists"}), 400
+        
     db.students.insert_one(data)
     return jsonify({"message": "Student added"}), 201
 
-@app.route('/api/tutor/students', methods=['GET'])
-@role_required('tutor')
-def get_my_students():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
-    if not tutor_class: return jsonify({"error": "No class assigned"}), 403
-    students = []
-    for doc in db.students.find({"classId": tutor_class['_id']}):
-        doc['_id'] = str(doc['_id'])
-        doc['classId'] = str(doc['classId'])
-        students.append(doc)
-    return jsonify(students), 200
-
-@app.route('/api/tutor/timetable', methods=['PUT'])
-@role_required('tutor')
-def update_timetable():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
-    if not tutor_class: return jsonify({"error": "No class assigned"}), 403
-    
-    data = request.get_json()
-    schedule = {}
-    for i in range(1, 7):
-        day = f"day_{i}"
-        if day in data:
-            schedule[day] = {}
-            for j in range(1, 6):
-                hour = f"hour_{j}"
-                fid = data[day].get(hour)
-                schedule[day][hour] = ObjectId(fid) if fid else None
-                
-    db.timetable.update_one(
-        {"classId": tutor_class['_id']},
-        {'$set': {"classId": tutor_class['_id'], "schedule": schedule}},
-        upsert=True
-    )
-    return jsonify({"message": "Timetable updated"}), 200
-
-@app.route('/api/tutor/timetable', methods=['GET'])
-@role_required('tutor')
-def get_timetable():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
-    if not tutor_class: return jsonify({"error": "No class assigned"}), 403
-    timetable = db.timetable.find_one({"classId": tutor_class['_id']})
-    if not timetable: return jsonify({"message": "No timetable"}), 404
-    
-    # Serialize ObjectIds
-    res = {"_id": str(timetable['_id']), "schedule": {}}
-    for day, hours in timetable['schedule'].items():
-        res['schedule'][day] = {}
-        for h, fid in hours.items():
-            res['schedule'][day][h] = str(fid) if fid else None
-    return jsonify(res), 200
-
-# --- TUTOR: Calendar ---
 @app.route('/api/tutor/calendar', methods=['POST'])
-@role_required('tutor')
-def set_calendar():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
+@role_required(['tutor'])
+def update_calendar():
+    tutor_id = get_jwt_identity()
+    my_class = db.classes.find_one({"tutorId": ObjectId(tutor_id)})
+    if not my_class: return jsonify({"error": "No class assigned"}), 403
+    
     data = request.get_json()
     db.calendar_events.update_one(
-        {"classId": tutor_class['_id'], "date": data['date']},
-        {"$set": {"day_order": int(data['day_order']) if data.get('day_order') else None, "event_title": data.get('event_title'), "classId": tutor_class['_id']}},
+        {"classId": my_class['_id'], "date": data['date']},
+        {"$set": {
+            "day_order": int(data['day_order']) if data.get('day_order') else None,
+            "event_title": data.get('event_title'),
+            "classId": my_class['_id']
+        }},
         upsert=True
     )
-    return jsonify({"message": "Calendar updated"}), 201
+    return jsonify({"message": "Calendar updated"}), 200
 
-@app.route('/api/tutor/calendar', methods=['GET'])
-@role_required('tutor')
-def get_calendar():
-    tutor_class = db.classes.find_one({"tutorId": ObjectId(get_jwt_identity())})
-    query = {"classId": tutor_class['_id']}
-    if request.args.get('month'):
-        query['date'] = {"$regex": f"^{request.args.get('year')}-{int(request.args.get('month')):02d}-"}
-    events = []
-    for doc in db.calendar_events.find(query):
-        doc['_id'] = str(doc['_id'])
-        doc['classId'] = str(doc['classId'])
-        events.append(doc)
-    return jsonify(events), 200
+# ==========================================
+# 5. STUDENT DASHBOARD
+# ==========================================
 
-# --- STUDENT DASHBOARD ---
 @app.route('/api/student/me', methods=['GET'])
-@role_required('student')
+@role_required(['student'])
 def get_student_me():
-    student = db.students.find_one({"_id": ObjectId(get_jwt_identity())})
-    s_class = db.classes.find_one({"_id": student['classId']})
+    student_id = get_jwt_identity()
+    student = db.students.find_one({"_id": ObjectId(student_id)})
+    class_name = "Unknown"
+    if student.get('classId'):
+        c = db.classes.find_one({"_id": student['classId']})
+        if c: class_name = f"{c['year']} {c['degreeType']} {c['department']}"
+
     return jsonify({
-        "name": student['name'], "registerNumber": student['registerNumber'],
-        "classInfo": {"year": s_class['year'], "dept": s_class['department']}
+        "name": student['name'],
+        "registerNumber": student['registerNumber'],
+        "className": class_name
     }), 200
 
 @app.route('/api/student/my-attendance', methods=['GET'])
-@role_required('student')
-def get_my_attendance():
-    records = list(db.attendance_records.find({"studentId": ObjectId(get_jwt_identity())}))
-    total = len(records)
-    present = sum(1 for r in records if r['status'] in ['present', 'on_duty'])
+@role_required(['student'])
+def get_student_dashboard_data():
+    student_id = get_jwt_identity()
+    student = db.students.find_one({"_id": ObjectId(student_id)})
+    class_id = student['classId']
     
-    serialized = []
-    for r in records:
-        r['_id'] = str(r['_id'])
-        r['studentId'] = str(r['studentId'])
-        r['markedBy'] = str(r['markedBy'])
-        r['classId'] = str(r['classId'])
-        serialized.append(r)
-
+    records = list(db.attendance_records.find({"studentId": ObjectId(student_id)}))
+    total_p = sum(1 for r in records if r['status'] == 'present')
+    total_a = sum(1 for r in records if r['status'] == 'absent')
+    total_od = sum(1 for r in records if r['status'] == 'on_duty')
+    total = total_p + total_a + total_od
+    pct = ((total_p + total_od) / total) * 100 if total > 0 else 0
+    
+    calendar_events = list(db.calendar_events.find({"classId": class_id}))
+    calendar_map = {}
+    
+    for event in calendar_events:
+        calendar_map[event['date']] = {
+            "day_order": event.get('day_order'),
+            "events": event.get('event_title'),
+            "attendance": {}
+        }
+        
+    for record in records:
+        date = record['date']
+        if date not in calendar_map:
+            calendar_map[date] = {"day_order": None, "events": None, "attendance": {}}
+        calendar_map[date]["attendance"][record['hour']] = record['status']
+        
     return jsonify({
-        "stats": {"percentage": (present/total)*100 if total > 0 else 0},
-        "records": serialized
+        "stats": {
+            "percentage": round(pct, 2),
+            "present": total_p,
+            "absent": total_a,
+            "onDuty": total_od
+        },
+        "calendar": calendar_map
     }), 200
-
-# --- FACULTY MARKING ---
-@app.route('/api/faculty/my-schedule', methods=['GET'])
-@role_required('faculty')
-def get_my_schedule():
-    fid = get_jwt_identity()
-    today = datetime.now().strftime('%Y-%m-%d')
-    # Find classes where calendar says today is a working day
-    # And timetable says this faculty teaches that day order
-    schedule = []
-    # (Simplified logic for brevity - reusing logic from previous step)
-    for tt in db.timetable.find():
-        cal = db.calendar_events.find_one({"classId": tt['classId'], "date": today})
-        if cal and cal.get('day_order'):
-            day = f"day_{cal['day_order']}"
-            if day in tt['schedule']:
-                for h, assigned_id in tt['schedule'][day].items():
-                    if str(assigned_id) == fid:
-                        c_info = db.classes.find_one({"_id": tt['classId']})
-                        schedule.append({
-                            "className": f"{c_info['year']} {c_info['department']}",
-                            "hour": int(h.split('_')[1]),
-                            "classId": str(c_info['_id'])
-                        })
-    return jsonify({"today": today, "schedule": schedule}), 200
-
-@app.route('/api/faculty/class-list/<classId>', methods=['GET'])
-@role_required('faculty')
-def get_class_list(classId):
-    today = datetime.now().strftime('%Y-%m-%d')
-    students = []
-    for s in db.students.find({"classId": ObjectId(classId)}):
-        att = {}
-        for i in range(1, 6):
-            rec = db.attendance_records.find_one({"studentId": s['_id'], "date": today, "hour": i})
-            att[f"hour_{i}"] = rec['status'] if rec else "not_marked"
-        students.append({
-            "studentId": str(s['_id']), "name": s['name'], 
-            "registerNumber": s['registerNumber'], "attendance": att
-        })
-    return jsonify(students), 200
-
-@app.route('/api/faculty/mark-attendance', methods=['POST'])
-@role_required('faculty')
-def mark_attendance():
-    data = request.get_json()
-    fid = get_jwt_identity()
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    student = db.students.find_one({"_id": ObjectId(data['studentId'])})
-    cal = db.calendar_events.find_one({"classId": student['classId'], "date": today})
-    
-    if not cal or not cal.get('day_order'):
-        return jsonify({"error": "Not a working day"}), 400
-        
-    tt = db.timetable.find_one({"classId": student['classId']})
-    day = f"day_{cal['day_order']}"
-    hour = f"hour_{data['hour']}"
-    
-    if str(tt['schedule'][day].get(hour)) != fid:
-        return jsonify({"error": "Access forbidden"}), 403
-        
-    db.attendance_records.update_one(
-        {"studentId": student['_id'], "date": today, "hour": data['hour']},
-        {"$set": {"status": data['status'], "markedBy": ObjectId(fid), "classId": student['classId']}},
-        upsert=True
-    )
-    return jsonify({"message": "Marked"}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -1,186 +1,238 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
-import './Dashboard.css'; // Reuse our common CSS
-import './StaffDashboard.css'; // Specific styles for staff
+import './Dashboard.css';
+import './StaffDashboard.css';
 
 const StaffDashboard = () => {
   const navigate = useNavigate();
-  const [schedule, setSchedule] = useState([]);
-  const [today, setToday] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [selectedClass, setSelectedClass] = useState(null); // To track which class is clicked
+  
+  // --- STATES ---
+  const [filters, setFilters] = useState({ year: '', department: '', shift: '', medium: '' });
+  const [classes, setClasses] = useState([]);
+  const [selectedClass, setSelectedClass] = useState(null);
   const [students, setStudents] = useState([]);
-  const [error, setError] = useState('');
+  const [hour, setHour] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState('');
+  
+  // --- (!!!) MISSING PART ADDED HERE (!!!) ---
+  const [roles, setRoles] = useState([]); 
 
   const token = localStorage.getItem('token');
 
-  // 1. Fetch Schedule on Load
   useEffect(() => {
     if (!token) {
       navigate('/');
       return;
     }
-    fetchSchedule();
-  }, [navigate, token]);
-
-  const fetchSchedule = async () => {
-    try {
-      const res = await axios.get('http://localhost:5000/api/faculty/my-schedule', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSchedule(res.data.schedule);
-      setToday(res.data.today);
-      setLoading(false);
-    } catch (err) {
-      setError('Failed to load schedule.');
-      setLoading(false);
-    }
-  };
-
-  // 2. Handle Class Click (Fetch Students)
-  const handleClassClick = async (classItem) => {
-    // Set selected class (including the specific hour!)
-    setSelectedClass(classItem); 
-    setLoading(true);
     
+    // Decode Token to get roles (Safety check included)
     try {
-      const res = await axios.get(`http://localhost:5000/api/faculty/class-list/${classItem.classId}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setStudents(res.data);
-      setLoading(false);
-    } catch (err) {
-      alert('Failed to load student list');
-      setLoading(false);
-      setSelectedClass(null);
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      setRoles(payload.roles || []);
+    } catch (e) {
+      console.error("Invalid token");
     }
-  };
-
-  // 3. Handle Marking Attendance
-  const markAttendance = async (studentId, status) => {
-    try {
-      await axios.post('http://localhost:5000/api/faculty/mark-attendance', {
-        studentId: studentId,
-        hour: selectedClass.hour, // We need the hour from the selected class
-        status: status
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
-      // Optimistically update the UI so it feels fast
-      setStudents(prevStudents => 
-        prevStudents.map(s => {
-          if (s.studentId === studentId) {
-            // Update the nested attendance object for the specific hour
-            return {
-              ...s,
-              attendance: {
-                ...s.attendance,
-                [`hour_${selectedClass.hour}`]: status
-              }
-            };
-          }
-          return s;
-        })
-      );
-
-    } catch (err) {
-      alert(err.response?.data?.error || 'Failed to mark attendance');
-    }
-  };
+  }, [token, navigate]);
 
   const handleLogout = () => {
     localStorage.removeItem('token');
     navigate('/');
   };
 
-  // --- RENDER ---
-  if (loading && !students.length) return <div className="loading-screen">Loading...</div>;
+  // --- 1. SEARCH CLASSES ---
+  const handleSearch = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const cleanFilters = {};
+      if (filters.department) cleanFilters.department = filters.department;
+      if (filters.year) cleanFilters.year = filters.year;
+      if (filters.shift) cleanFilters.shift = filters.shift;
+      if (filters.medium) cleanFilters.medium = filters.medium;
+
+      const params = new URLSearchParams(cleanFilters).toString();
+      
+      const res = await axios.get(`http://localhost:5000/api/admin/classes?${params}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (res.data.length === 0) {
+        alert("No classes found matching these filters.");
+      }
+      setClasses(res.data);
+      setSelectedClass(null);
+    } catch (err) {
+      console.error("Search Error:", err.response);
+      if (err.response && err.response.status === 401) {
+        alert("Session expired. Please login again.");
+        handleLogout();
+      } else {
+        alert(err.response?.data?.error || "Failed to search classes");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- 2. SELECT CLASS & FETCH STUDENTS ---
+  const handleClassClick = async (cls) => {
+    setSelectedClass(cls);
+    setLoading(true);
+    const date = new Date().toISOString().split('T')[0];
+    
+    try {
+      const res = await axios.get(`http://localhost:5000/api/staff/class-students/${cls._id}?date=${date}&hour=${hour}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      const initializedStudents = res.data.map(s => ({
+        ...s,
+        status: s.status || 'present'
+      }));
+      
+      setStudents(initializedStudents);
+    } catch (err) {
+      alert("Failed to load students");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- 3. MARK ATTENDANCE ---
+  const toggleStatus = (studentId, newStatus) => {
+    setStudents(prev => prev.map(s => 
+      s.studentId === studentId ? { ...s, status: newStatus } : s
+    ));
+  };
+
+  // --- 4. SUBMIT ATTENDANCE ---
+  const handleSubmit = async () => {
+    setLoading(true);
+    const date = new Date().toISOString().split('T')[0];
+    
+    const payload = {
+      classId: selectedClass._id,
+      date: date,
+      hour: hour,
+      records: students.map(s => ({ studentId: s.studentId, status: s.status }))
+    };
+
+    try {
+      await axios.post('http://localhost:5000/api/staff/submit-attendance', payload, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setMessage('Attendance Submitted Successfully!');
+      setTimeout(() => setMessage(''), 3000);
+    } catch (err) {
+      alert("Failed to submit attendance");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div className="dashboard-container">
       <header className="dashboard-header">
         <div>
           <h1>Staff Dashboard</h1>
-          <p className="sub-text">Date: {today}</p>
+          <p className="sub-text">Attendance Portal</p>
         </div>
-        <button onClick={handleLogout} className="logout-btn">Logout</button>
+        <div style={{display:'flex', gap:'10px'}}>
+          
+          {/* (!!!) BUTTON VISIBLE ONLY TO TUTORS (!!!) */}
+          {roles.includes('tutor') && (
+            <button 
+              onClick={() => navigate('/admin-dashboard')} 
+              className="logout-btn" 
+              style={{background: '#00b894'}}
+            >
+              Manage My Class
+            </button>
+          )}
+          
+          <button onClick={handleLogout} className="logout-btn">Logout</button>
+        </div>
       </header>
 
-      {error && <div className="error-msg">{error}</div>}
-
-      {/* VIEW 1: THE SCHEDULE (Show if no class selected) */}
+      {/* FILTER SECTION */}
       {!selectedClass && (
-        <div className="schedule-section">
-          <h2>Your Schedule Today</h2>
-          {schedule.length === 0 ? (
-            <p className="no-data">No classes scheduled for today.</p>
-          ) : (
-            <div className="class-grid">
-              {schedule.map((item, index) => (
-                <div key={index} className="class-card" onClick={() => handleClassClick(item)}>
-                  <div className="hour-badge">Hour {item.hour}</div>
-                  <h3>{item.className}</h3>
-                  <p>Click to mark attendance</p>
-                </div>
-              ))}
-            </div>
-          )}
+        <div className="filter-card">
+          <h3>Find Class</h3>
+          <form onSubmit={handleSearch} className="filter-form">
+            <input type="text" placeholder="Dept (e.g. Computer Science)" value={filters.department} onChange={e => setFilters({...filters, department: e.target.value})} />
+            <select value={filters.year} onChange={e => setFilters({...filters, year: e.target.value})}>
+              <option value="">Year</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+            <select value={filters.shift} onChange={e => setFilters({...filters, shift: e.target.value})}>
+              <option value="">Shift</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+            </select>
+            <button type="submit" className="search-btn">Search</button>
+          </form>
+
+          <div className="class-grid">
+            {classes.map(cls => (
+              <div key={cls._id} className="class-card" onClick={() => handleClassClick(cls)}>
+                <h4>{cls.year} {cls.degreeType} {cls.department}</h4>
+                <p>Shift {cls.shift} | {cls.medium}</p>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
-      {/* VIEW 2: THE STUDENT LIST (Show if class is selected) */}
+      {/* MARKING SECTION */}
       {selectedClass && (
-        <div className="attendance-section">
-          <button className="back-btn" onClick={() => {setSelectedClass(null); setStudents([]);}}>
-            ← Back to Schedule
-          </button>
-          
-          <h2>Marking: {selectedClass.className} (Hour {selectedClass.hour})</h2>
-          
+        <div className="marking-section">
+          <div className="marking-header">
+            <button className="back-link" onClick={() => setSelectedClass(null)}>← Back</button>
+            <div>
+              <h2>{selectedClass.year} {selectedClass.department}</h2>
+              <div className="hour-selector">
+                <label>Select Hour:</label>
+                <select value={hour} onChange={e => { setHour(e.target.value); handleClassClick(selectedClass); }}>
+                  {[1,2,3,4,5].map(h => <option key={h} value={h}>Hour {h}</option>)}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          {message && <div className="success-msg">{message}</div>}
+
           <div className="table-responsive">
             <table className="attendance-table">
               <thead>
                 <tr>
                   <th>Reg No</th>
                   <th>Name</th>
-                  <th>Action</th>
+                  <th>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {students.map((student) => {
-                  const currentStatus = student.attendance[`hour_${selectedClass.hour}`];
-                  return (
-                    <tr key={student.studentId}>
-                      <td>{student.registerNumber}</td>
-                      <td>{student.name}</td>
-                      <td className="action-cell">
-                        <button 
-                          className={`status-btn present ${currentStatus === 'present' ? 'active' : ''}`}
-                          onClick={() => markAttendance(student.studentId, 'present')}
-                        >
-                          P
-                        </button>
-                        <button 
-                          className={`status-btn absent ${currentStatus === 'absent' ? 'active' : ''}`}
-                          onClick={() => markAttendance(student.studentId, 'absent')}
-                        >
-                          A
-                        </button>
-                        <button 
-                          className={`status-btn onduty ${currentStatus === 'on_duty' ? 'active' : ''}`}
-                          onClick={() => markAttendance(student.studentId, 'on_duty')}
-                        >
-                          OD
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {students.map(s => (
+                  <tr key={s.studentId}>
+                    <td>{s.registerNumber}</td>
+                    <td>{s.name}</td>
+                    <td className="actions">
+                      <button className={`status-btn p ${s.status === 'present' ? 'active' : ''}`} onClick={() => toggleStatus(s.studentId, 'present')}>P</button>
+                      <button className={`status-btn a ${s.status === 'absent' ? 'active' : ''}`} onClick={() => toggleStatus(s.studentId, 'absent')}>A</button>
+                      <button className={`status-btn od ${s.status === 'on_duty' ? 'active' : ''}`} onClick={() => toggleStatus(s.studentId, 'on_duty')}>OD</button>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>
+          
+          <button className="submit-attendance-btn" onClick={handleSubmit} disabled={loading}>
+            {loading ? 'Submitting...' : 'Submit Attendance'}
+          </button>
         </div>
       )}
     </div>
